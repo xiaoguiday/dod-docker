@@ -24,15 +24,19 @@ app.get('/debug-logs', (req, res) => {
     }
 });
 
-// 3. 动态生成符合 Xray 官方标准的 Bridge 配置
+// 3. 动态生成支持多设备参数的 Bridge 配置
 function generateXrayConfig() {
     const tunnelProtocol = process.env.TUNNEL_PROTOCOL || 'vless';
     const gcpIp = process.env.GCP_IP;
     const gcpPort = parseInt(process.env.GCP_PORT, 10);
     const tunnelKey = process.env.TUNNEL_KEY;
-    const tunnelCipher = process.env.TUNNEL_CIPHER || 'aes-256-gcm';
+    const tunnelCipher = process.env.TUNNEL_CIPHER || 'aes-128-gcm'; 
     const tunnelNetwork = process.env.TUNNEL_NETWORK || 'tcp';
     const tunnelPath = process.env.TUNNEL_PATH || '/';
+
+    // === 核心新增：多设备反代变量提取（提供默认值以确保向下兼容） ===
+    const tunnelTag = process.env.TUNNEL_TAG || 'reverse-4';
+    const tunnelDomain = process.env.TUNNEL_DOMAIN || 'reverse.xui4';
 
     if (!gcpIp || !gcpPort || !tunnelKey) {
         fs.writeFileSync('/app/xray.log', "【错误】缺少关键环境变量：GCP_IP, GCP_PORT 或 TUNNEL_KEY\n");
@@ -48,6 +52,12 @@ function generateXrayConfig() {
         streamSettings.wsSettings = {
             "path": tunnelPath
         };
+    } else if (tunnelNetwork === 'tcp') {
+        streamSettings.tcpSettings = {
+            "header": {
+                "type": "none"
+            }
+        };
     }
 
     if (tunnelProtocol === 'shadowsocks' || tunnelProtocol === 'ss') {
@@ -57,7 +67,8 @@ function generateXrayConfig() {
                     "address": gcpIp,
                     "port": gcpPort,
                     "password": tunnelKey,
-                    "method": tunnelCipher
+                    "method": tunnelCipher,
+                    "uot": true 
                 }
             ]
         };
@@ -81,42 +92,80 @@ function generateXrayConfig() {
 
     const config = {
         "log": {
-            "loglevel": "warning"
+            "loglevel": "info"
         },
-        "reverse": {
-            // 核心修正 1：官方标准的内网端关键字必须是 bridges
-            "bridges": [
-                {
-                    "tag": "bridge-portal",
-                    "domain": "reverse.tunnel"
-                }
-            ]
-        },
-        "outbounds": [
+        "inbounds": [
             {
-                "tag": "outbound-to-gcp",
-                "protocol": tunnelProtocol === 'ss' ? 'shadowsocks' : tunnelProtocol,
-                "settings": outboundSettings,
-                "streamSettings": streamSettings
-            },
+                "tag": "api",
+                "listen": "127.0.0.1",
+                "port": 6666,
+                "protocol": "dokodemo-door",
+                "settings": {
+                    "address": "127.0.0.1"
+                }
+            }
+        ],
+        "outbounds": [
             {
                 "tag": "direct",
                 "protocol": "freedom",
+                "settings": {
+                    "domainStrategy": "UseIP"
+                }
+            },
+            {
+                "tag": "blocked",
+                "protocol": "blackhole",
                 "settings": {}
+            },
+            {
+                "tag": "reverse-proxy", 
+                "protocol": tunnelProtocol === 'ss' ? 'shadowsocks' : tunnelProtocol,
+                "settings": outboundSettings,
+                "streamSettings": streamSettings
             }
         ],
         "routing": {
+            "domainStrategy": "AsIs",
             "rules": [
                 {
                     "type": "field",
-                    "inboundTag": ["bridge-portal"],
-                    "outboundTag": "direct"
+                    "outboundTag": "blocked",
+                    "ip": [
+                        "geoip:private"
+                    ]
                 },
-                // 核心修正 2：官方标准必须有的隧道路由规则，将虚拟域名反向导向我们的中转连接
                 {
                     "type": "field",
-                    "domain": ["reverse.tunnel"],
-                    "outboundTag": "outbound-to-gcp"
+                    "outboundTag": "blocked",
+                    "protocol": [
+                        "bittorrent"
+                    ]
+                },
+                {
+                    "type": "field",
+                    "outboundTag": "reverse-proxy",
+                    "inboundTag": [
+                        tunnelTag
+                    ],
+                    "domain": [
+                        "full:" + tunnelDomain
+                    ]
+                },
+                {
+                    "type": "field",
+                    "outboundTag": "direct",
+                    "inboundTag": [
+                        tunnelTag
+                    ]
+                }
+            ]
+        },
+        "reverse": {
+            "bridges": [
+                {
+                    "tag": tunnelTag,
+                    "domain": tunnelDomain
                 }
             ]
         }
