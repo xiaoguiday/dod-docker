@@ -1,14 +1,22 @@
-FROM teddysun/xray:latest
+FROM node:alpine3.22
 
-# 复制伪装网页和动态启动脚本到镜像中
-COPY index.html /etc/xray/index.html
-COPY entrypoint.sh /entrypoint.sh
+WORKDIR /tmp
 
-# 赋予启动脚本可执行权限
-RUN chmod +x /entrypoint.sh
+COPY index.js index.html package.json ./
 
-# 声明容器内部使用的默认网页端口
-EXPOSE 80
+EXPOSE 3000/tcp
 
-# 设置容器启动时的入口脚本
-ENTRYPOINT ["/entrypoint.sh"]
+# 安装基础系统依赖，并自动下载官方最新版 Xray-core
+RUN apk update && apk upgrade && \
+    apk add --no-cache openssl curl gcompat iproute2 coreutils bash unzip && \
+    # 下载官方最新版 Xray-core 二进制文件并移动到 /usr/bin/xray
+    curl -L -o /tmp/xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip && \
+    unzip /tmp/xray.zip -d /tmp/xray-bin && \
+    mv /tmp/xray-bin/xray /usr/bin/xray && \
+    rm -rf /tmp/xray.zip /tmp/xray-bin && \
+    # 给启动入口和 Xray 赋予执行权限
+    chmod +x index.js /usr/bin/xray && \
+    # 安装 node 项目依赖
+    npm install
+
+CMD ["node", "index.js"]
