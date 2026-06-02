@@ -11,7 +11,7 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 2. 秘密日志诊断页面（访问 https://您的网址/debug-logs 即可查看）
+// 2. 秘密日志诊断页面
 app.get('/debug-logs', (req, res) => {
     const logPath = '/app/xray.log';
     res.header('Content-Type', 'text/plain; charset=utf-8');
@@ -24,16 +24,60 @@ app.get('/debug-logs', (req, res) => {
     }
 });
 
-// 3. 动态生成 Xray 配置文件
+// 3. 动态生成 Xray 配置文件（同时兼容 Shadowsocks 和 VLESS+WS）
 function generateXrayConfig() {
+    const tunnelProtocol = process.env.TUNNEL_PROTOCOL || 'vless';
     const gcpIp = process.env.GCP_IP;
     const gcpPort = parseInt(process.env.GCP_PORT, 10);
     const tunnelKey = process.env.TUNNEL_KEY;
-    const tunnelCipher = process.env.TUNNEL_CIPHER || '2022-blake3-aes-128-gcm';
+    const tunnelCipher = process.env.TUNNEL_CIPHER || 'aes-256-gcm';
+    const tunnelNetwork = process.env.TUNNEL_NETWORK || 'tcp';
+    const tunnelPath = process.env.TUNNEL_PATH || '/';
 
     if (!gcpIp || !gcpPort || !tunnelKey) {
         fs.writeFileSync('/app/xray.log', "【错误】缺少关键环境变量：GCP_IP, GCP_PORT 或 TUNNEL_KEY\n");
         return false;
+    }
+
+    let outboundSettings = {};
+    let streamSettings = {
+        "network": tunnelNetwork
+    };
+
+    // 如果使用 WebSocket，配置对应的路径参数
+    if (tunnelNetwork === 'ws') {
+        streamSettings.wsSettings = {
+            "path": tunnelPath
+        };
+    }
+
+    if (tunnelProtocol === 'shadowsocks' || tunnelProtocol === 'ss') {
+        outboundSettings = {
+            "servers": [
+                {
+                    "address": gcpIp,
+                    "port": gcpPort,
+                    "password": tunnelKey,
+                    "method": tunnelCipher
+                }
+            ]
+        };
+    } else {
+        // VLESS 协议配置
+        outboundSettings = {
+            "vnext": [
+                {
+                    "address": gcpIp,
+                    "port": gcpPort,
+                    "users": [
+                        {
+                            "id": tunnelKey,
+                            "encryption": "none"
+                        }
+                    ]
+                }
+            ]
+        };
     }
 
     const config = {
@@ -52,20 +96,9 @@ function generateXrayConfig() {
         "outbounds": [
             {
                 "tag": "outbound-to-gcp",
-                "protocol": "shadowsocks",
-                "settings": {
-                    "servers": [
-                        {
-                            "address": gcpIp,
-                            "port": gcpPort,
-                            "password": tunnelKey,
-                            "method": tunnelCipher
-                        }
-                    ]
-                },
-                "streamSettings": {
-                    "network": "tcp"
-                }
+                "protocol": tunnelProtocol === 'ss' ? 'shadowsocks' : tunnelProtocol,
+                "settings": outboundSettings,
+                "streamSettings": streamSettings
             },
             {
                 "tag": "direct",
@@ -89,17 +122,15 @@ function generateXrayConfig() {
     return true;
 }
 
-// 4. 启动 Xray 并将日志重定向到文件
+// 4. 启动 Xray
 function startXray() {
     if (!generateXrayConfig()) return;
 
     console.log("【系统】正在启动后台 Xray 通道...");
-    
-    // 将标准输出和错误输出全部重定向写入到 /app/xray.log
     exec('/usr/bin/xray -config /app/xray-config/config.json > /app/xray.log 2>&1');
 }
 
-// 5. 监听端口
+// 5. 运行 Node 服务
 app.listen(port, () => {
     console.log(`【系统】Camouflage Node Server 启动，监听端口: ${port}`);
     startXray();
