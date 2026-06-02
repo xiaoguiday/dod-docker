@@ -184,6 +184,21 @@ function startXray() {
     }
 }
 
+setInterval(() => {
+    const logPath = '/tmp/xray.log';
+    try {
+        if (fs.existsSync(logPath)) {
+            const stats = fs.statSync(logPath);
+            const maxSizeBytes = 2 * 1024 * 1024;
+            if (stats.size > maxSizeBytes) {
+                fs.writeFileSync(logPath, "log truncated due to size limit\n");
+            }
+        }
+    } catch (e) {
+        console.error("failed to truncate log", e);
+    }
+}, 3600000);
+
 app.listen(port, () => {
     startXray();
 });
