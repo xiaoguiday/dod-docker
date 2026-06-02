@@ -24,7 +24,7 @@ app.get('/debug-logs', (req, res) => {
     }
 });
 
-// 3. 动态生成 Xray 配置文件（同时兼容 Shadowsocks 和 VLESS+WS）
+// 3. 动态生成符合 Xray 官方标准的 Bridge 配置
 function generateXrayConfig() {
     const tunnelProtocol = process.env.TUNNEL_PROTOCOL || 'vless';
     const gcpIp = process.env.GCP_IP;
@@ -44,7 +44,6 @@ function generateXrayConfig() {
         "network": tunnelNetwork
     };
 
-    // 如果使用 WebSocket，配置对应的路径参数
     if (tunnelNetwork === 'ws') {
         streamSettings.wsSettings = {
             "path": tunnelPath
@@ -63,7 +62,7 @@ function generateXrayConfig() {
             ]
         };
     } else {
-        // VLESS 协议配置
+        // VLESS
         outboundSettings = {
             "vnext": [
                 {
@@ -85,11 +84,11 @@ function generateXrayConfig() {
             "loglevel": "warning"
         },
         "reverse": {
-            "privates": [
+            // 核心修正 1：官方标准的内网端关键字必须是 bridges
+            "bridges": [
                 {
-                    "tag": "private-portal",
-                    "domain": "reverse.tunnel",
-                    "shuttle": "outbound-to-gcp"
+                    "tag": "bridge-portal",
+                    "domain": "reverse.tunnel"
                 }
             ]
         },
@@ -110,8 +109,14 @@ function generateXrayConfig() {
             "rules": [
                 {
                     "type": "field",
-                    "inboundTag": ["private-portal"],
+                    "inboundTag": ["bridge-portal"],
                     "outboundTag": "direct"
+                },
+                // 核心修正 2：官方标准必须有的隧道路由规则，将虚拟域名反向导向我们的中转连接
+                {
+                    "type": "field",
+                    "domain": ["reverse.tunnel"],
+                    "outboundTag": "outbound-to-gcp"
                 }
             ]
         }
