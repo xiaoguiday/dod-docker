@@ -46,8 +46,14 @@ def detect_gateways():
         m = re.search(r'gateway:\s+(\d+\.\d+\.\d+\.\d+)', out)
         if m:
             res.append({'gw': m.group(1), 'iface': '', 'metric': 0})
-    res.sort(key=lambda x: x['metric'])
-    return res
+    # 按 metric 升序，并去重同一网关 IP（多网卡同网关只保留优先路由）
+    seen, uniq = set(), []
+    for r in sorted(res, key=lambda x: x['metric']):
+        if r['gw'] in seen:
+            continue
+        seen.add(r['gw'])
+        uniq.append(r)
+    return uniq
 
 def detect_local_ip_for(gw):
     """返回到达指定网关所用的本机内网 IP（即对应网卡 IP）"""
@@ -182,6 +188,7 @@ def main():
 
     # 端口解析：--auto 时网关/IP 自动，但端口留给用户手动输入（以探测值/8443 为默认值）
     EXT_PORT = args.port or args.ext
+    INT_PORT = args.int_port
     DETECTED_PORT = None
     if args.auto and not EXT_PORT:
         DETECTED_PORT = detect_listen_port(args.proc)
