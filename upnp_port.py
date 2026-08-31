@@ -3,10 +3,11 @@
 """
 UPnP 端口映射 + 自动保活（支持多网卡 / 双 WAN）
   --auto : 自动枚举所有默认路由网关，逐个探测 UPnP，用各自网卡的 IP 做 internal client
-  -d     : 循环保活，周期性重新 AddPortMapping 刷新租约，防止路由器回收
+  -d     : 映射后直接转入后台保活（无交互），周期性刷新租约防止路由器回收
+  交互运行（不带 -d）时，会询问是否启用后台保活，并让你设定间隔（默认 1 小时）
   纯标准库，兼容 x86/arm、Linux/macOS
 """
-import socket, re, subprocess, urllib.request, urllib.error, time, argparse, sys
+import socket, re, subprocess, urllib.request, urllib.error, time, argparse, sys, os
 from urllib.parse import urljoin
 
 def ask(prompt, default):
@@ -46,7 +47,6 @@ def detect_gateways():
         m = re.search(r'gateway:\s+(\d+\.\d+\.\d+\.\d+)', out)
         if m:
             res.append({'gw': m.group(1), 'iface': '', 'metric': 0})
-    # 按 metric 升序，并去重同一网关 IP（多网卡同网关只保留优先路由）
     seen, uniq = set(), []
     for r in sorted(res, key=lambda x: x['metric']):
         if r['gw'] in seen:
@@ -56,7 +56,6 @@ def detect_gateways():
     return uniq
 
 def detect_local_ip_for(gw):
-    """返回到达指定网关所用的本机内网 IP（即对应网卡 IP）"""
     if gw:
         out = run(f"ip route get {gw} 2>/dev/null")
         m = re.search(r'src\s+(\d+\.\d+\.\d+\.\d+)', out)
@@ -135,7 +134,6 @@ def build_soap(stype, url, action, args):
         return 'HTTP%d %s' % (e.code, e.read().decode(errors='ignore'))
 
 def make_client(loc, body, ext_port, int_port, int_ip):
-    """为一个网关构造 soap/add_mapping 闭包"""
     m = re.search(r'<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>.*?<controlURL>(.*?)</controlURL>', body, re.S)
     ctrl = m.group(1)
     stype = 'urn:schemas-upnp-org:service:WANIPConnection:1'
@@ -171,6 +169,42 @@ def make_client(loc, body, ext_port, int_port, int_ip):
         return True
     return url, add_mapping, soap
 
+# ---------- 后台保活（daemonize） ----------
+def keepalive_loop(clients, renew):
+    print('==== 后台保活启动：每 %d 秒刷新所有网关租约 ====' % renew)
+    while True:
+        time.sleep(renew)
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        for router, int_ip, add_mapping in clients:
+            tag = '[%s] 网关 %s' % (ts, router)
+            if add_mapping():
+                print(tag + ' [OK] 已刷新')
+            else:
+                print(tag + ' [!] 刷新失败，下次重试')
+
+def daemonize_and_run(renew, clients, logfile):
+    pid = os.fork()
+    if pid > 0:
+        print('已转入后台保活，日志:', logfile)
+        print('查看: tail -f', logfile, '| 停止: pkill -f upnp_port.py')
+        return
+    os.setsid()
+    pid = os.fork()
+    if pid > 0:
+        os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        dn = open(os.devnull)
+        os.dup2(dn.fileno(), 0)
+        logf = open(logfile, 'a')
+        os.dup2(logf.fileno(), 1)
+        os.dup2(logf.fileno(), 2)
+    except Exception:
+        pass
+    keepalive_loop(clients, renew)
+    os._exit(0)
+
 def main():
     p = argparse.ArgumentParser(description='UPnP 端口映射 + 自动保活（支持多网卡/双WAN）')
     p.add_argument('--auto', action='store_true', help='自动枚举所有网关/网卡IP/代理端口')
@@ -180,13 +214,13 @@ def main():
     p.add_argument('--int-ip', default=None, help='内部目标 IP（默认=自动探测对应网卡IP）')
     p.add_argument('--port', default=None, help='内外统一端口')
     p.add_argument('--proc', default='sing-box', help='自动探测端口时匹配的进程名')
-    p.add_argument('--renew', type=int, default=600, help='保活间隔秒（默认 600）')
-    p.add_argument('-d', '--daemon', action='store_true', help='映射后循环保活')
+    p.add_argument('--renew', type=int, default=3600, help='保活间隔秒（默认 3600=1小时）')
+    p.add_argument('-d', '--daemon', action='store_true', help='映射后直接转入后台保活（无交互）')
+    p.add_argument('--log', default='/var/log/upnp_port.log', help='后台保活日志文件路径')
     args = p.parse_args()
 
     print('=== UPnP 端口映射（支持多网卡/双 WAN）===')
 
-    # 端口解析：--auto 时网关/IP 自动，但端口留给用户手动输入（以探测值/8443 为默认值）
     EXT_PORT = args.port or args.ext
     INT_PORT = args.int_port
     DETECTED_PORT = None
@@ -194,8 +228,7 @@ def main():
         DETECTED_PORT = detect_listen_port(args.proc)
         print('[自动] 探测到的代理监听端口:', DETECTED_PORT or '(未探测到)')
 
-    # 收集目标网关
-    targets = []  # 每项: {router, int_ip, loc, body}
+    targets = []
     if args.router:
         gws = [{'gw': args.router, 'iface': '', 'metric': 0}]
     elif args.auto:
@@ -217,7 +250,6 @@ def main():
         if args.auto:
             print('[失败] --auto 模式下未发现任何默认路由网关，无法自动映射。')
             raise SystemExit(1)
-        # 纯交互/SSDP 模式
         ROUTER_IP = ask('路由器网关 IP (留空=SSDP 自动发现)', '192.168.0.1')
         EXT_PORT = EXT_PORT or ask('外部端口 (对外)', '8443')
         INT_PORT = INT_PORT or ask('内部端口 (本机监听)', EXT_PORT)
@@ -233,14 +265,12 @@ def main():
         print('[失败] 没有任何可用网关具备 UPnP，无法映射。')
         raise SystemExit(1)
 
-    # 端口收尾：--auto 下网关/IP 已自动，端口需手动输入（带默认值）；其余不交互
     if not EXT_PORT:
         EXT_PORT = ask('外部端口 (对外)', DETECTED_PORT or '8443')
     if not INT_PORT:
         INT_PORT = EXT_PORT if args.auto else ask('内部端口 (本机监听)', EXT_PORT)
     EXT_PORT, INT_PORT = str(EXT_PORT), str(INT_PORT)
 
-    # 构造各网关 client
     clients = []
     for t in targets:
         int_ip = t['int_ip'] or detect_local_ip_for(t['router'])
@@ -255,7 +285,6 @@ def main():
             print(f'   [信息] 获取外网 IP 失败（不影响映射）: {err}')
         clients.append((t['router'], int_ip, add_mapping))
 
-    # 初次映射
     ok_all = True
     for router, int_ip, add_mapping in clients:
         print(f'>> 映射 网关 {router} (内网 {int_ip}:{INT_PORT})')
@@ -264,23 +293,23 @@ def main():
     if not ok_all:
         raise SystemExit(1)
 
-    if not args.daemon:
-        print('==== 映射已添加（非保活模式）====')
+    if args.daemon:
+        daemonize_and_run(args.renew, clients, args.log)
         return
 
-    print(f'==== 保活模式：每 {args.renew} 秒刷新所有网关租约（Ctrl+C 退出）====')
-    try:
-        while True:
-            time.sleep(args.renew)
-            ts = time.strftime('%Y-%m-%d %H:%M:%S')
-            for router, int_ip, add_mapping in clients:
-                tag = f'[{ts}] 网关 {router}'
-                if add_mapping():
-                    print(f'{tag} [OK] 已刷新')
-                else:
-                    print(f'{tag} [!] 刷新失败，下次重试')
-    except KeyboardInterrupt:
-        print('\n[退出] 保活已停止。')
+    yn = ask('是否启用后台保活（防止路由器回收映射）?', 'n')
+    if str(yn).strip().lower() in ('y', 'yes', '是'):
+        iv = ask('保活间隔（秒，直接回车默认 1 小时）', '3600')
+        try:
+            interval = int(iv)
+        except ValueError:
+            interval = 3600
+        if interval < 30:
+            interval = 30
+        daemonize_and_run(interval, clients, args.log)
+        return
+
+    print('==== 映射已添加（未启用保活）====')
 
 if __name__ == '__main__':
     main()
